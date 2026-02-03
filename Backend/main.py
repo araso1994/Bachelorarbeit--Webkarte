@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
-
+import time
 import httpx
 from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query
@@ -32,8 +32,8 @@ OPENPLZ_BASE = "https://openplzapi.org"
 PHOTON_BASE = "https://photon.komoot.io/api"
 WIKI_LANG = "de"
 
-# Idealerweise eine echte Kontaktadresse
-USER_AGENT = "BUW-PLZ-Karte/1.0 (Bachelorarbeit; Kontakt: aras.ahmad@example.com)"
+
+USER_AGENT = "BUW-PLZ-Karte/1.0 (Bachelorarbeit; Kontakt: aras.ahmad1@uni-wuppertal.de)"
 
 # ============================================================
 # Cache (Performance)
@@ -234,46 +234,90 @@ async def fetch_from_photon(
 @app.get("/api/search/plz/{postal_code}")
 async def search_plz(postal_code: str) -> Dict[str, Any]:
     postal_code = (postal_code or "").strip()
-    if not postal_code:
-        raise HTTPException(status_code=400, detail="postal_code missing")
+    start_time = time.time()
+
+    if not postal_code or not postal_code.isdigit() or len(postal_code) != 5:
+        raise HTTPException(
+            status_code=400, detail="postal_code invalid (expected 5 digits)"
+        )
 
     payload = await fetch_openplz(
         "/de/Localities",
         params={"postalCode": postal_code, "page": 1, "pageSize": 50},
     )
     items = _extract_items(payload)
-    print("PLZ raw items:", len(items))
-    if items:
-        print("PLZ sample item keys:", list(items[0].keys()))
-        print(
-            "PLZ sample lat/lon:", items[0].get("latitude"), items[0].get("longitude")
-        )
 
+    # --- 1) Marker aus OpenPLZ (falls coords existieren) ---
     markers: List[Dict[str, Any]] = []
+
+    # Hint für Wikipedia + Photon-Fallback (Ort/Bundesland)
+    name_hint: Optional[str] = None
+    state_hint: Optional[str] = None
+
+    if items:
+        # mögliche Felder: name / municipality etc.
+        name_hint = (
+            items[0].get("name") or items[0].get("municipality") or ""
+        ).strip() or None
+        fs = items[0].get("federalState") or {}
+        if isinstance(fs, dict):
+            state_hint = (fs.get("name") or "").strip() or None
+
     for item in items:
         lat = item.get("latitude")
         lon = item.get("longitude")
+
+        print("DEBUG PLZ item:", item.get("name"), lat, lon)
+
         if lat is None or lon is None:
             continue
 
         markers.append(
             {
-                "id": f"{item.get('postalCode')}-{item.get('name')}",
-                "name": item.get("name"),
-                "postalCode": item.get("postalCode"),
-                "state": (item.get("federalState") or {}).get("name"),
+                "id": f"{postal_code}-{item.get('name')}",
+                "name": item.get("name") or name_hint or f"PLZ {postal_code}",
+                "postalCode": item.get("postalCode") or postal_code,
+                "state": (item.get("federalState") or {}).get("name") or state_hint,
                 "lat": float(lat),
                 "lon": float(lon),
                 "source": "openplz",
             }
         )
 
-    info = None
-    if markers:
-        # für PLZ: Info zur Stadt (wenn vorhanden)
-        info = await fetch_wikipedia_summary(
-            markers[0].get("name") or postal_code, WIKI_LANG
-        )
+    # --- 2) FALLBACK: Photon, wenn OpenPLZ keine coords liefert ---
+    if not markers:
+        # Query möglichst präzise: PLZ + Ort + Deutschland
+        if name_hint:
+            q = f"{postal_code} {name_hint}, Deutschland"
+        else:
+            q = f"{postal_code}, Deutschland"
+
+        photon_markers = await fetch_from_photon(q, limit=10, lang="de")
+
+        # postalCode/state ggf. ergänzen
+        normalized: List[Dict[str, Any]] = []
+        for m in photon_markers:
+            normalized.append(
+                {
+                    "id": str(m.get("id")),
+                    "name": m.get("name") or name_hint or f"PLZ {postal_code}",
+                    "postalCode": postal_code,  # wichtig: sicher setzen
+                    "state": m.get("state") or state_hint,
+                    "lat": float(m.get("lat")),
+                    "lon": float(m.get("lon")),
+                    "source": "photon",
+                }
+            )
+        markers = normalized
+
+    wiki_title = name_hint
+    if not wiki_title and markers:
+        wiki_title = markers[0].get("name")
+
+    info = await fetch_wikipedia_summary(wiki_title, WIKI_LANG) if wiki_title else None
+
+    end_time = time.time()
+    print(f"Backend processing time (PLZ): {end_time - start_time:.3f} seconds")
 
     return {
         "query": {"type": "plz", "value": postal_code},
